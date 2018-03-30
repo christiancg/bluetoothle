@@ -3,10 +3,13 @@ using Android.Bluetooth;
 using Android.OS;
 using Java.Lang;
 using System;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Reactive.Disposables;
 using System.Reactive.Linq;
+using System.Reactive.Threading.Tasks;
 using System.Threading;
+using System.Threading.Tasks;
 using Exception = System.Exception;
 
 
@@ -14,10 +17,14 @@ namespace Plugin.BluetoothLE.Internals
 {
     public class DeviceContext
     {
+        readonly ConcurrentQueue<Func<Task>> actions;
+
+
         public DeviceContext(BluetoothDevice device, GattCallbacks callbacks)
         {
             this.NativeDevice = device;
             this.Callbacks = callbacks;
+            this.actions = new ConcurrentQueue<Func<Task>>();
         }
 
 
@@ -26,7 +33,6 @@ namespace Plugin.BluetoothLE.Internals
         public GattCallbacks Callbacks { get; }
 
 
-        readonly AutoResetEvent reset = new AutoResetEvent(true);
         public IObservable<T> Lock<T>(IObservable<T> inner)
         {
             if (CrossBleAdapter.AndroidDisableLockMechanism)
@@ -34,57 +40,104 @@ namespace Plugin.BluetoothLE.Internals
 
             return Observable.Create<T>(ob =>
             {
-                IDisposable sub = null;
-                var pastGate = false;
                 var cancel = false;
-                Log.Debug("Device", "Lock - at the gate");
-
-                this.reset.WaitOne();
-
-                if (cancel)
+                this.actions.Enqueue(async () =>
                 {
-                    Log.Debug("Device", "Lock - past the gate, but was cancelled");
-                }
-                else
-                {
-                    pastGate = true;
-                    Log.Debug("Device", "Lock - past the gate");
-
-                    if (CrossBleAdapter.AndroidOperationPause != null)
-                        System.Threading.Thread.Sleep(CrossBleAdapter.AndroidOperationPause.Value);
-
-                    sub = inner.Subscribe(
-                        ob.OnNext,
-                        ex =>
-                        {
-                            Log.Debug("Device", "Task errored - releasing lock");
-                            this.reset.Set();
-                            pastGate = false;
-                            ob.OnError(ex);
-                        },
-                        () =>
-                        {
-                            Log.Debug("Device", "Task completed - releasing lock");
-                            this.reset.Set();
-                            pastGate = false;
-                            ob.OnCompleted();
-                        }
-                    );
-                }
-
-                return () =>
-                {
-                    cancel = true;
-                    sub?.Dispose();
-
-                    if (pastGate)
+                    try
                     {
-                        Log.Debug("Device", "Cleanup releasing lock");
-                        this.reset.Set();
+                        if (!cancel)
+                        {
+                            var result = await inner.ToTask().ConfigureAwait(false);
+                            ob.Respond(result);
+                        }
                     }
-                };
+                    catch (System.Exception ex)
+                    {
+                        ob.OnError(ex);
+                    }
+                });
+                this.ProcessQueue(); // fire and forget
+
+                return () => cancel = true;
             });
         }
+
+
+        bool running;
+        async void ProcessQueue()
+        {
+            if (this.running)
+                return;
+
+            this.running = true;
+            var ts = CrossBleAdapter.AndroidOperationPause;
+            while (this.actions.TryDequeue(out Func<Task> task))
+            {
+                await task();
+                if (ts != null)
+                    await Task.Delay(ts.Value);
+            }
+            this.running = false;
+        }
+        //readonly AutoResetEvent reset = new AutoResetEvent(true);
+        //public IObservable<T> Lock<T>(IObservable<T> inner)
+        //{
+        //    if (CrossBleAdapter.AndroidDisableLockMechanism)
+        //        return inner;
+
+        //    return Observable.Create<T>(ob =>
+        //    {
+        //        IDisposable sub = null;
+        //        var pastGate = false;
+        //        var cancel = false;
+        //        Log.Debug("Device", "Lock - at the gate");
+
+        //        this.reset.WaitOne();
+
+        //        if (cancel)
+        //        {
+        //            Log.Debug("Device", "Lock - past the gate, but was cancelled");
+        //        }
+        //        else
+        //        {
+        //            pastGate = true;
+        //            Log.Debug("Device", "Lock - past the gate");
+
+        //            if (CrossBleAdapter.AndroidOperationPause != null)
+        //                System.Threading.Thread.Sleep(CrossBleAdapter.AndroidOperationPause.Value);
+
+        //            sub = inner.Subscribe(
+        //                ob.OnNext,
+        //                ex =>
+        //                {
+        //                    Log.Debug("Device", "Task errored - releasing lock");
+        //                    this.reset.Set();
+        //                    pastGate = false;
+        //                    ob.OnError(ex);
+        //                },
+        //                () =>
+        //                {
+        //                    Log.Debug("Device", "Task completed - releasing lock");
+        //                    this.reset.Set();
+        //                    pastGate = false;
+        //                    ob.OnCompleted();
+        //                }
+        //            );
+        //        }
+
+        //        return () =>
+        //        {
+        //            cancel = true;
+        //            sub?.Dispose();
+
+        //            if (pastGate)
+        //            {
+        //                Log.Debug("Device", "Cleanup releasing lock");
+        //                this.reset.Set();
+        //            }
+        //        };
+        //    });
+        //}
 
 
         public IObservable<object> Marshall(Action action) => Observable.Create<object>(ob =>
@@ -107,6 +160,26 @@ namespace Plugin.BluetoothLE.Internals
             }
             return Disposable.Empty;
         });
+
+
+        //public void InvokeOnMainThread(Action action)
+        //{
+        //    if (CrossBleAdapter.AndroidPerformActionsOnMainThread)
+        //    {
+        //        if (Application.SynchronizationContext == SynchronizationContext.Current)
+        //        {
+        //            this.Execute(() => action();
+        //        }
+        //        else
+        //        {
+        //            Application.SynchronizationContext.Post(_ => this.Execute(action, ob), null);
+        //        }
+        //    }
+        //    else
+        //    {
+        //        action();
+        //    }
+        //}
 
 
         protected virtual void Execute(Action action, IObserver<object> ob)
